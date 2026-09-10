@@ -1,6 +1,6 @@
 # DORA Metrics: Practical Implementation Guide
 
-> How to measure Deployment Frequency, Lead Time, Change Failure Rate, and MTTR across fragmented toolchains — and the top tools that do it out of the box.
+> How to measure software delivery performance across fragmented toolchains — updated for 2026 with honest assessments of what works, what doesn't, and what no tool solves for you.
 
 ---
 
@@ -15,379 +15,685 @@ These aren't vanity metrics. Teams that improve on DORA metrics see direct impac
 
 ---
 
-## The Four Metrics
+## The Five Metrics (Updated 2026)
+
+As of January 2026, DORA officially tracks **5 metrics** (not 4). The addition of Deployment Rework Rate reflects the reality that rollbacks and hotfixes are a distinct signal from change failure rate.
 
 | Metric | What It Measures | Elite | High | Medium | Low |
 |--------|-----------------|-------|------|--------|-----|
 | **Deployment Frequency** | How often you deploy to production | Many per day | Daily to weekly | Weekly to monthly | Monthly+ |
-| **Lead Time for Changes** | Commit to running in production | < 1 day | 1 day - 1 week | 1 week - 1 month | > 1 month |
-| **Change Failure Rate** | % of deployments causing incidents | 5% | 10% | 15% | 64% |
-| **Mean Time to Restore (MTTR)** | Incident detection to resolution | < 1 hour | < 1 day | 1 day - 1 week | 1 month+ |
+| **Change Lead Time** | Commit to running in production | < 1 day | 1 day - 1 week | 1 week - 1 month | > 1 month |
+| **Change Fail Rate** | % of deployments needing rollback/hotfix | 5% | 10% | 15% | 64% |
+| **Failed Deployment Recovery Time** | Time to recover from a failed deployment | < 1 hour | < 1 day | 1 day - 1 week | 1 month+ |
+| **Deployment Rework Rate** (NEW) | Ratio of unplanned deploys caused by prod incidents | Low | Moderate | High | Very High |
+
+> **Note**: "Failed Deployment Recovery Time" replaces the older "MTTR" terminology. "Deployment Rework Rate" is new — it captures how much of your deployment activity is reactive firefighting vs planned delivery.
 
 ---
 
-## How Computation Actually Works (The Hard Part)
+## The Real-World Problem: Not Every Commit Goes Straight to Prod
 
-### The Core Challenge: Data Spread Across Systems
-
-In most real-world setups, no single tool owns the full picture:
+DORA's theoretical model assumes continuous delivery — every commit flows to production independently. **This is not how most enterprises work.** The typical enterprise flow looks like this:
 
 ```
-┌──────────┐    ┌──────────┐    ┌───────────────┐    ┌───────────┐    ┌────────────┐
-│  GitHub   │───>│  GHA CI  │───>│ Artifact Reg  │───>│  ArgoCD   │───>│ Production │
-│ (commit)  │    │ (build)  │    │ (image:SHA)   │    │ (deploy)  │    │ (running)  │
-└─────┬─────┘    └─────┬────┘    └───────────────┘    └─────┬─────┘    └─────┬──────┘
-      │                │                                     │               │
-      │          Events / Webhooks / APIs                    │               │
-      v                v                                     v               v
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    DORA Metrics Platform                                        │
-│                                                                                 │
-│  Correlation Key: COMMIT SHA flows through every system                        │
-│  Joins with: Incident management (PagerDuty / Jira / Opsgenie)                │
-└─────────────────────────────────────────────────────────────────────────────────┘
+Developer commits (Day 1)
+    │
+    ├── Multiple developers commit to feature branches (Days 1-10)
+    │
+    ▼
+Merge to develop/integration branch (Day 10)
+    │
+    ├── Automated tests run (CI)
+    │
+    ▼
+Code freeze announced (Day 12)
+    │
+    ├── Release branch cut
+    │
+    ▼
+QA/UAT cycle begins (Days 12-18)
+    │
+    ├── Manual testing (regression, UAT sign-off)
+    ├── Bug fixes cherry-picked to release branch
+    │
+    ▼
+Production deployment (Day 20)
+    │
+    └── 30+ commits deployed as a single batch
 ```
 
-### The Commit SHA: Universal Correlation Key
+**The hard truth**: DORA's official guidance does NOT address how to compute lead time for batched releases. Their position is philosophical — reduce batch size, move toward continuous delivery. But you need metrics for where you ARE today, not where you want to be.
 
-The **commit SHA** is the thread that ties everything together:
+---
 
-1. **GitHub**: Commit `abc123` is created (timestamp = `T_commit`)
-2. **GHA**: Build triggered, image tagged `myapp:abc123`, pushed to Artifact Registry
-3. **ArgoCD/Harness**: Deploys image `myapp:abc123` to production (timestamp = `T_deploy`)
-4. **PagerDuty/Jira**: Incident linked to deployment containing `abc123`
+## How Lead Time Actually Works for Batched Releases
 
-Every DORA metric is computed by joining data across these timestamps.
+### The Three Approaches (With Honest Trade-offs)
 
-### Per-Metric Computation
-
-#### 1. Deployment Frequency
+#### Approach 1: Per-Commit Lead Time (DORA Purist)
 
 ```
-Formula: count(production_deployments) / time_period
+Lead Time = T_prod_deploy - T_commit_authored
 
-Data Source: CD tool (ArgoCD sync events, Harness pipeline executions)
+For a release with 30 commits:
+  - Commit A authored Day 1  → deployed Day 20 → Lead Time = 19 days
+  - Commit B authored Day 5  → deployed Day 20 → Lead Time = 15 days
+  - Commit Z authored Day 10 → deployed Day 20 → Lead Time = 10 days
 
-ArgoCD:
-  - Application sync events where target = production
-  - kubectl get applications -n argocd -o json → .status.history[]
-
-Harness:
-  - Pipeline executions with environment = production
-  - GET /pipeline/api/pipelines/execution/summary?module=cd
-
-GHA (if deploying via GHA):
-  - Workflow runs where workflow_name contains "deploy" AND conclusion = "success"
-  - GET /repos/{owner}/{repo}/actions/runs?event=deployment
+Report: median = 15 days, p95 = 19 days
 ```
 
-#### 2. Lead Time for Changes
+**Pros**: True DORA definition. Exposes how long developers actually wait.
+**Cons**: Penalizes long-lived feature branches. A commit authored Day 1 but not merged until Day 9 shows as 19 days even though it was "active" for only 1 day.
+
+#### Approach 2: Per-MR/PR Lead Time (GitLab's Approach — Industry Standard)
 
 ```
-Formula: T_deploy - T_commit (for each commit SHA in the deployment)
+Lead Time = T_prod_deploy - T_merge_to_main
 
-Data Sources: GitHub API (commit timestamp) + CD tool (deploy timestamp)
+For a release with 30 commits (merged as 12 PRs):
+  - PR #101 merged Day 8  → deployed Day 20 → Lead Time = 12 days
+  - PR #105 merged Day 10 → deployed Day 20 → Lead Time = 10 days
+  - PR #112 merged Day 12 → deployed Day 20 → Lead Time = 8 days
 
-Step 1 — Get commit timestamp:
-  GET /repos/{owner}/{repo}/commits/{sha}
-  → .commit.author.date = T_commit
-
-Step 2 — Get deploy timestamp:
-  ArgoCD: Application sync history → .deployedAt for the revision containing SHA
-  Harness: Pipeline execution → .startTs for the deployment containing SHA
-
-Step 3 — Compute:
-  lead_time = T_deploy - T_commit
-  Report: median (p50) and p95 across all commits in the period
+Report: median = 10 days
 ```
 
-#### 3. Change Failure Rate
+**Pros**: Pragmatic. Captures the "system wait time" — how long merged, reviewed code sits before reaching production. This is the delay the platform team can actually influence.
+**Cons**: Hides development time within the feature branch.
+
+#### Approach 3: Release-Level Lead Time (Common Enterprise Shortcut)
 
 ```
-Formula: deployments_causing_incidents / total_deployments * 100
+Lead Time = T_prod_deploy - T_code_freeze
 
-Data Sources: CD tool (deployment list) + Incident management (incidents)
-
-Step 1 — List all production deployments in period (from CD tool)
-Step 2 — List all incidents in period (from PagerDuty/Jira)
-Step 3 — Link incidents to deployments:
-  - Time correlation: incident opened within N hours of deployment
-  - Explicit link: incident references commit SHA or deployment ID
-  - Rollback detection: a revert/rollback deploy shortly after a forward deploy
-
-The hard part: defining "caused by a deployment" vs coincidental timing.
-Best practice: require explicit incident tagging during postmortem.
+Code freeze Day 12 → deployed Day 20 → Lead Time = 8 days
 ```
 
-#### 4. Mean Time to Restore (MTTR)
+**Pros**: Simple. Measures QA/release process overhead directly.
+**Cons**: Hides everything before code freeze. NOT a valid DORA metric — but useful as an internal operational metric.
+
+### Recommendation for Enterprise Platform Teams
+
+**Use Approach 2 (per-MR) as your primary DORA metric**, supplemented with Approach 3 as an operational metric.
+
+Why: Per-MR lead time is the one metric that a centralized platform team can actually influence (faster CI, faster deploys, better environments). Development time within feature branches is a team-level concern, not a platform concern.
 
 ```
-Formula: avg(T_resolved - T_detected) for all incidents
-
-Data Sources: Incident management system (primary)
-
-PagerDuty:
-  GET /incidents?statuses[]=resolved&since={start}&until={end}
-  MTTR = resolved_at - created_at (per incident)
-
-Jira:
-  JQL: project = OPS AND type = Incident AND resolved >= -30d
-  MTTR = resolutiondate - created (per issue)
-
-Opsgenie:
-  GET /v2/incidents?status=resolved
-  MTTR = report.closedAt - report.detectedAt
+┌─────────────────────────────────────────────────────────────────────┐
+│                    LEAD TIME DECOMPOSITION                          │
+│                                                                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  ┌───────┐  │
+│  │  Coding  │─>│  Review  │─>│  Merge   │─>│   QA   │─>│Deploy │  │
+│  │  Time    │  │  Time    │  │  to main │  │  Cycle │  │to Prod│  │
+│  └──────────┘  └──────────┘  └──────────┘  └────────┘  └───────┘  │
+│  ◄── Team owns ──────────────►◄── Platform team owns ───────────► │
+│                                                                     │
+│  Sleuth tracks these phases:                                        │
+│  Coding → Review Lag → Review Time → Deploying                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## How Big Organizations Do This in Practice
+## How to Track Manual Testing in DORA Metrics
 
-### Pattern 1: Event-Driven Collection (Most Common)
+**Honest assessment: No DORA tool tracks manual testing natively.** Not Sleuth, not Faros, not the archived Four Keys, not GitLab. This is a universal gap.
 
-Every tool in the pipeline emits events (webhooks) to a central collector:
+Manual testing time is *implicitly* captured in lead time (it's part of the delay between merge and deploy), but it's not broken out as a sub-metric by any standard tool. You have to instrument it yourself.
 
-```yaml
-# GitHub webhook → on push/merge
-{
-  "event": "push",
-  "sha": "abc123",
-  "timestamp": "2026-09-10T10:00:00Z",
-  "repository": "myapp",
-  "branch": "main"
-}
+### Pattern: Jira Workflow Timestamps
 
-# GHA webhook → on workflow completion
-{
-  "event": "workflow_run",
-  "sha": "abc123",
-  "conclusion": "success",
-  "workflow": "build-and-push",
-  "completed_at": "2026-09-10T10:08:00Z"
-}
+The most practical approach is to use your issue tracker's workflow transitions as stage markers:
 
-# ArgoCD webhook/notification → on sync
-{
-  "event": "sync",
-  "sha": "abc123",
-  "application": "myapp-prod",
-  "synced_at": "2026-09-10T10:12:00Z",
-  "status": "Healthy"
-}
+```
+Jira Workflow for Release:
+  ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌───────────┐    ┌──────────┐
+  │  To Do   │───>│ In Dev    │───>│ In QA    │───>│ QA Passed │───>│ Released │
+  │          │    │           │    │          │    │           │    │          │
+  │ T_create │    │ T_dev     │    │ T_qa     │    │ T_passed  │    │ T_deploy │
+  └──────────┘    └───────────┘    └──────────┘    └───────────┘    └──────────┘
 
-# PagerDuty webhook → on incident
-{
-  "event": "incident.resolved",
-  "service": "myapp",
-  "created_at": "2026-09-10T11:00:00Z",
-  "resolved_at": "2026-09-10T11:25:00Z"
-}
+QA Cycle Time = T_passed - T_qa
+Total Lead Time = T_deploy - T_dev (or T_merge)
+QA as % of Lead Time = QA Cycle Time / Total Lead Time * 100
 ```
 
-### Pattern 2: API Polling (Simpler but Delayed)
+### Pattern: Test Management Tool Integration
 
-A scheduled job (cron, GHA scheduled workflow) polls each tool's API periodically:
+If you use Zephyr, TestRail, or qTest for manual test execution:
+
+```
+Capture from test management API:
+  - Test cycle start time (when QA begins execution)
+  - Test cycle end time (when all test cases pass/fail)
+  - Number of defects found → fed back as bug fix cycle time
+  - Re-test cycles (how many rounds before sign-off)
+
+TestRail API example:
+  GET /index.php?/api/v2/get_runs/{project_id}
+  → .runs[] | {started_on, completed_on, failed_count, passed_count}
+```
+
+### Pattern: GitHub Deployment Environments as Stage Gates
+
+Use GitHub's native environment protection rules to create observable QA stages:
 
 ```yaml
-# .github/workflows/dora-collector.yml
-name: DORA Metrics Collection
-on:
-  schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
-
+# .github/workflows/release.yml
 jobs:
-  collect:
-    runs-on: ubuntu-latest
+  deploy-staging:
+    environment: staging           # ← timestamp recorded by GitHub
     steps:
-      - name: Collect GHA deploy runs
-        run: |
-          gh api repos/${{ github.repository }}/actions/runs \
-            --jq '.workflow_runs[] | select(.name | contains("deploy")) | 
-            {sha: .head_sha, status: .conclusion, completed: .updated_at}'
+      - run: deploy-to-staging.sh
 
-      - name: Collect ArgoCD syncs
-        run: |
-          argocd app list -o json | jq '.[] | 
-            {app: .metadata.name, revision: .status.sync.revision, 
-             health: .status.health.status, synced: .status.operationState.finishedAt}'
+  manual-qa:                       
+    needs: deploy-staging
+    environment: manual-qa         # ← requires manual approval in GitHub
+    steps:                         # ← approval timestamp = QA start
+      - run: echo "QA approved"    # ← completion timestamp = QA end
 
-      - name: Collect PagerDuty incidents
-        run: |
-          curl -s -H "Authorization: Token token=$PD_TOKEN" \
-            "https://api.pagerduty.com/incidents?since=$(date -d '-6 hours' -Iseconds)" \
-            | jq '.incidents[] | {id: .id, service: .service.summary, 
-              created: .created_at, resolved: .resolved_at}'
-
-      - name: Compute and store metrics
-        run: python compute_dora.py  # Join data, compute metrics, push to dashboard
+  deploy-production:
+    needs: manual-qa
+    environment: production        # ← production deploy timestamp
+    steps:
+      - run: deploy-to-prod.sh
 ```
 
-### Pattern 3: Deploy Markers (Pragmatic Shortcut)
+```bash
+# Extract QA cycle time from GitHub Environments API
+gh api repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments
+# Shows: environment, wait_timer, reviewers, current_status
 
-Instead of correlating across systems, instrument the deploy step itself:
+# After approval:
+gh api repos/{owner}/{repo}/actions/runs/{run_id}/approvals
+# Shows: environment, approved_at (= QA sign-off timestamp)
+```
+
+This gives you **observable timestamps for manual QA** without any custom tooling — GitHub records when the approval was requested (QA started) and when it was granted (QA passed).
+
+---
+
+## Handling Different Branching Strategies Across Teams
+
+### The Reality
+
+In any large organization, teams use different strategies:
+
+| Strategy | Who Uses It | How Releases Work |
+|----------|-------------|-------------------|
+| **Trunk-based** | Mature DevOps teams | Every merge to main → auto-deploy |
+| **GitFlow** | Teams with release cycles | develop → release branch → main → deploy |
+| **Release branches** | Teams with QA gates | main → release/v1.2 → QA → deploy |
+| **Environment branches** | Legacy teams | dev branch → staging branch → prod branch |
+
+### The Platform Team's Normalization Strategy
+
+**Don't force teams into one branching strategy. Normalize at the measurement layer.**
+
+The key insight: regardless of branching strategy, every team has two events you can observe:
+
+1. **Code is "done"** = PR/MR merged to the team's integration branch (whatever they call it)
+2. **Code reaches production** = deployment event from CD tool
+
+```
+                    ┌─────────────────────────────────────┐
+                    │    NORMALIZATION LAYER               │
+                    │                                      │
+  Trunk-based:     │  merge to main ──────────> prod      │  Lead Time = hours
+  GitFlow:         │  merge to develop ────────> prod     │  Lead Time = days
+  Release branch:  │  merge to release/X ─────> prod     │  Lead Time = days
+  Env branches:    │  merge to staging ────────> prod     │  Lead Time = weeks
+                    │                                      │
+                    │  ALL measured as:                     │
+                    │  T_prod_deploy - T_merge_event       │
+                    └─────────────────────────────────────┘
+```
+
+### Implementation: Branch-Agnostic Event Collection
+
+Configure your metrics platform to watch **deployment events only** (not branch merges) as the primary signal:
 
 ```yaml
-# In your ArgoCD post-sync hook or Harness pipeline
-- name: Record deployment
-  script: |
-    curl -X POST https://your-dora-platform/api/deployments \
-      -d '{
-        "service": "myapp",
-        "sha": "'$GIT_SHA'",
-        "environment": "production",
-        "deployer": "argocd",
-        "timestamp": "'$(date -Iseconds)'"
-      }'
+# Platform-level configuration per team
+teams:
+  - name: payments
+    repos: [payments-api, payments-ui]
+    deploy_detection: argocd_sync     # ArgoCD app name = payments-prod
+    merge_branch: main                # Trunk-based
+    
+  - name: inventory  
+    repos: [inventory-service]
+    deploy_detection: harness_pipeline # Harness pipeline = inventory-prod-deploy
+    merge_branch: develop             # GitFlow — track merge to develop
+    
+  - name: reporting
+    repos: [reports-engine]
+    deploy_detection: gha_workflow     # GHA workflow = deploy-production
+    merge_branch: release/*           # Release branches — track merge to release/*
+```
+
+The **deployment event** is the universal anchor — it comes from the CD tool and is the same regardless of branching strategy. Work backward from the deploy to find the associated commits/PRs.
+
+---
+
+## Four Keys: Honest Assessment (Why You Shouldn't Use It As-Is)
+
+### Status: Archived January 2024
+
+The `dora-team/fourkeys` GitHub repository is **archived and read-only**. The README states:
+
+> *"This repository is not currently maintained. We encourage you to explore it, fork it, or otherwise use it as inspiration."*
+
+**No GCP-native replacement exists.** Google Cloud Deploy does NOT have built-in DORA metrics dashboards. The DORA team at Google now recommends the [DORA Quick Check](https://dora.dev/quickcheck/) self-assessment and *"source-available or commercial products with pre-built integrations"* rather than custom-built pipelines.
+
+### Why Four Keys Fails for Enterprise Batched Releases
+
+Four Keys was built on assumptions that don't hold in enterprise environments:
+
+| Assumption | Reality |
+|-----------|---------|
+| Every merge to main triggers a deployment | Batched releases, code freezes, manual approvals |
+| Commit SHA maps 1:1 to a deployment | 30+ commits per release, squash merges break SHA links |
+| No intermediate stages between merge and deploy | UAT, manual QA, change advisory boards, release trains |
+| All teams use the same branching strategy | GitFlow, trunk-based, release branches coexist |
+| Deployments are atomic per-repo | Multi-repo deployments, mono-repo with partial deploys |
+
+The Four Keys BigQuery SQL directly correlated merge events to deploy events by SHA. If your flow has staging/UAT/manual QA between merge and prod, there is no hook for those intermediate stages.
+
+### What's Still Valuable from Four Keys
+
+The **architectural pattern** is sound even though the code is abandoned:
+
+```
+Events (webhooks) → Ingestion (Cloud Run/Function) → Storage (BigQuery) → Dashboard (Looker/Grafana)
+```
+
+If you want to build on GCP, fork the pattern (not the code) and add:
+- Stage-aware event model (not just merge → deploy)
+- Release entity linking multiple commits/PRs to a single deployment
+- QA stage timestamps from Jira/test management tools
+- Team-level configuration for branching strategy normalization
+
+---
+
+## Recommended Approach for a Centralized Platform Team
+
+### The Platform DORA Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        TEAM TOOLCHAINS (Diverse)                        │
+│                                                                         │
+│  Team A: GitHub → GHA → ArgoCD → Prod    (trunk-based)                 │
+│  Team B: GitHub → GHA → Harness → Prod   (GitFlow)                    │
+│  Team C: GitLab → Jenkins → ArgoCD → Prod (release branches)          │
+│  Team D: GitHub → GHA → GHA Deploy → Prod (trunk-based)               │
+└────────┬───────────────────┬──────────────────┬────────────────────┬────┘
+         │                   │                  │                    │
+    Webhooks/APIs       Webhooks/APIs      Webhooks/APIs       Webhooks/APIs
+         │                   │                  │                    │
+         ▼                   ▼                  ▼                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    NORMALIZATION LAYER (Platform-Owned)                  │
+│                                                                         │
+│  Event Ingestion    ───>  Canonical Data Model  ───>  Metric Compute   │
+│  (Cloud Run)              (BigQuery)                  (Scheduled Query) │
+│                                                                         │
+│  Canonical Events:                                                      │
+│  ┌────────────────────────────────────────────────────────────┐         │
+│  │ { team, repo, event_type, sha, branch, timestamp,         │         │
+│  │   environment, release_id, metadata }                      │         │
+│  │                                                            │         │
+│  │ event_type: commit | pr_merged | build_complete |          │         │
+│  │             qa_started | qa_passed | deployed |            │         │
+│  │             incident_opened | incident_resolved            │         │
+│  └────────────────────────────────────────────────────────────┘         │
+│                                                                         │
+│  Release Entity (the missing piece in Four Keys):                       │
+│  ┌────────────────────────────────────────────────────────────┐         │
+│  │ { release_id, team, repo, environment,                     │         │
+│  │   commits: [sha1, sha2, ...],                              │         │
+│  │   prs: [pr1, pr2, ...],                                    │         │
+│  │   code_freeze_at, qa_start_at, qa_end_at, deployed_at }   │         │
+│  └────────────────────────────────────────────────────────────┘         │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    DASHBOARD LAYER                                       │
+│                                                                         │
+│  Org-level:  All 5 DORA metrics, trend over time, band classification  │
+│  Team-level: Per-team DORA + lead time decomposition                   │
+│  Drill-down: Per-release breakdown (coding → review → QA → deploy)    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Tool Recommendation: Revised (Post-Research)
+
+Given that Four Keys is archived and your scenario involves batched releases + manual QA + diverse branching:
+
+| Criteria | Sleuth | Faros AI CE | Build-Your-Own (GCP) |
+|----------|--------|-------------|----------------------|
+| **Handles batched releases** | Yes (per-deploy averaging) | Yes (normalized model) | Yes (if you build it) |
+| **Manual QA tracking** | No (manual gap) | Partial (Jira connector) | Yes (custom events) |
+| **Diverse branching** | Partial (deploy-anchored) | Yes (100+ connectors) | Yes (configurable) |
+| **Time to value** | Hours | 1-3 days | 2-4 weeks |
+| **Maintenance** | Zero | Low | Medium-High |
+| **Cost (100 devs)** | ~$2,900/mo | Free (self-hosted) | GCP infra ~$50-100/mo |
+| **Customization** | Limited | GraphQL queries | Unlimited |
+| **Air-gapped / on-prem** | No | Yes | Yes |
+
+### Honest Recommendation
+
+**For most enterprise platform teams: Start with Sleuth or Faros AI CE to get baseline metrics in days, not months.** Use the data to prove value to leadership. Then decide whether to build custom tooling for the gaps (manual QA tracking, release-level decomposition).
+
+**If you must build on GCP** (compliance, data residency, existing GCP investment):
+
+Fork the Four Keys *pattern* (not the archived code) with these additions:
+1. **Release entity** linking commits/PRs to deployments
+2. **Stage events** for QA (from Jira workflow transitions)
+3. **Team configuration** for branching strategy normalization
+4. **5 metrics** (not 4 — add Deployment Rework Rate)
+
+---
+
+## Build-Your-Own on GCP: Practical Blueprint
+
+If you choose to build this as a platform service on GCP, here's the architecture that addresses all the gaps:
+
+### Component 1: Event Ingestion (Cloud Run)
+
+```python
+# Receives webhooks from GitHub, ArgoCD, Jira, PagerDuty
+# Normalizes into canonical events and writes to BigQuery
+
+CANONICAL_EVENT_SCHEMA = {
+    "event_id": "string",
+    "timestamp": "timestamp",
+    "team": "string",
+    "repo": "string",
+    "event_type": "string",     # commit, pr_merged, build, qa_started, qa_passed, deployed, incident_opened, incident_resolved
+    "sha": "string",
+    "branch": "string",
+    "environment": "string",    # dev, staging, uat, production
+    "release_id": "string",     # groups commits into a release
+    "metadata": "json",         # tool-specific payload
+}
+```
+
+### Component 2: Release Linker (Scheduled Cloud Function)
+
+This is the piece Four Keys never had — it groups commits into releases:
+
+```sql
+-- BigQuery: Link commits to releases
+-- A "release" is defined as all commits between two production deployments
+
+WITH deployments AS (
+  SELECT 
+    team, repo, sha, timestamp as deployed_at,
+    LAG(timestamp) OVER (PARTITION BY team, repo ORDER BY timestamp) as prev_deploy_at
+  FROM events
+  WHERE event_type = 'deployed' AND environment = 'production'
+),
+release_commits AS (
+  SELECT 
+    d.team, d.repo, d.deployed_at,
+    c.sha as commit_sha,
+    c.timestamp as committed_at,
+    TIMESTAMP_DIFF(d.deployed_at, c.timestamp, HOUR) as lead_time_hours
+  FROM deployments d
+  JOIN events c ON c.team = d.team AND c.repo = d.repo
+    AND c.event_type = 'pr_merged'
+    AND c.timestamp > COALESCE(d.prev_deploy_at, TIMESTAMP('1970-01-01'))
+    AND c.timestamp <= d.deployed_at
+)
+SELECT 
+  team, repo, deployed_at,
+  COUNT(commit_sha) as commits_in_release,
+  AVG(lead_time_hours) as avg_lead_time_hours,
+  MAX(lead_time_hours) as max_lead_time_hours,    -- oldest commit in batch
+  MIN(lead_time_hours) as min_lead_time_hours     -- newest commit in batch
+FROM release_commits
+GROUP BY team, repo, deployed_at
+```
+
+### Component 3: QA Cycle Tracking (Jira Webhook Parser)
+
+```python
+# Parse Jira webhook for workflow transitions
+def parse_jira_event(payload):
+    changelog = payload.get("changelog", {}).get("items", [])
+    for item in changelog:
+        if item["field"] == "status":
+            if item["toString"] == "In QA":
+                return {
+                    "event_type": "qa_started",
+                    "release_id": extract_release_from_jira(payload),
+                    "timestamp": payload["timestamp"],
+                    "team": extract_team(payload),
+                }
+            elif item["toString"] == "QA Passed":
+                return {
+                    "event_type": "qa_passed",
+                    "release_id": extract_release_from_jira(payload),
+                    "timestamp": payload["timestamp"],
+                    "team": extract_team(payload),
+                }
+```
+
+### Component 4: DORA Computation (Scheduled BigQuery Query)
+
+```sql
+-- All 5 DORA metrics computed from canonical events
+
+-- 1. Deployment Frequency (per team, per week)
+SELECT team, DATE_TRUNC(timestamp, WEEK) as week,
+  COUNT(*) as deploy_count
+FROM events
+WHERE event_type = 'deployed' AND environment = 'production'
+GROUP BY team, week;
+
+-- 2. Change Lead Time (per team, per week — using PR merge as start)
+SELECT team, DATE_TRUNC(deployed_at, WEEK) as week,
+  APPROX_QUANTILES(lead_time_hours, 100)[OFFSET(50)] as p50_lead_time_hours,
+  APPROX_QUANTILES(lead_time_hours, 100)[OFFSET(95)] as p95_lead_time_hours
+FROM release_commits_view
+GROUP BY team, week;
+
+-- 3. Change Fail Rate
+WITH deploys AS (
+  SELECT team, DATE_TRUNC(timestamp, WEEK) as week, COUNT(*) as total
+  FROM events WHERE event_type = 'deployed' AND environment = 'production'
+  GROUP BY team, week
+),
+failures AS (
+  SELECT team, DATE_TRUNC(timestamp, WEEK) as week, COUNT(*) as failed
+  FROM events WHERE event_type = 'incident_opened'
+  GROUP BY team, week
+)
+SELECT d.team, d.week, 
+  SAFE_DIVIDE(f.failed, d.total) * 100 as change_fail_rate_pct
+FROM deploys d LEFT JOIN failures f ON d.team = f.team AND d.week = f.week;
+
+-- 4. Failed Deployment Recovery Time
+SELECT team, DATE_TRUNC(i.timestamp, WEEK) as week,
+  AVG(TIMESTAMP_DIFF(r.timestamp, i.timestamp, MINUTE)) as avg_recovery_minutes
+FROM events i
+JOIN events r ON i.team = r.team 
+  AND r.event_type = 'incident_resolved'
+  AND r.metadata->>'incident_id' = i.metadata->>'incident_id'
+WHERE i.event_type = 'incident_opened'
+GROUP BY team, week;
+
+-- 5. Deployment Rework Rate (NEW in DORA 2026)
+WITH all_deploys AS (
+  SELECT team, DATE_TRUNC(timestamp, WEEK) as week, COUNT(*) as total
+  FROM events WHERE event_type = 'deployed' AND environment = 'production'
+  GROUP BY team, week
+),
+unplanned_deploys AS (
+  SELECT team, DATE_TRUNC(timestamp, WEEK) as week, COUNT(*) as unplanned
+  FROM events 
+  WHERE event_type = 'deployed' AND environment = 'production'
+    AND JSON_VALUE(metadata, '$.is_hotfix') = 'true'
+  GROUP BY team, week
+)
+SELECT a.team, a.week,
+  SAFE_DIVIDE(u.unplanned, a.total) * 100 as rework_rate_pct
+FROM all_deploys a LEFT JOIN unplanned_deploys u ON a.team = u.team AND a.week = u.week;
+```
+
+### Component 5: QA Sub-Metrics (Bonus — Not Standard DORA)
+
+```sql
+-- QA cycle time as a sub-metric of Lead Time
+SELECT team, DATE_TRUNC(qa_started, WEEK) as week,
+  AVG(TIMESTAMP_DIFF(qa_passed, qa_started, HOUR)) as avg_qa_hours,
+  COUNT(*) as releases_tested
+FROM (
+  SELECT 
+    s.team,
+    s.timestamp as qa_started,
+    p.timestamp as qa_passed,
+    s.release_id
+  FROM events s
+  JOIN events p ON s.release_id = p.release_id 
+    AND s.team = p.team
+    AND s.event_type = 'qa_started' 
+    AND p.event_type = 'qa_passed'
+)
+GROUP BY team, week;
 ```
 
 ---
 
-## Top 3 Tools for Out-of-the-Box DORA Metrics
+## How Big Organizations Handle This Problem
 
-These tools work **regardless of your CI/CD and code repo tooling** — they sit outside the pipeline and observe it.
+### The Uncomfortable Truth
 
-### 1. Sleuth (sleuth.io) — Best Overall
+**No published case studies from Google, Netflix, or Spotify (2025-2026) detail how they run DORA as a centralized platform service.** The Spotify Backstage DORA plugin exists in community discussions but has no official documentation. Google's own DORA team archived their only tool.
 
-**Why**: Purpose-built for DORA. Fastest time-to-value.
+What we know from the DORA 2024 report:
 
-| Aspect | Detail |
-|--------|--------|
-| **Setup time** | < 1 day |
-| **Integrations** | GitHub, GitLab, Bitbucket, GHA, Jenkins, CircleCI, ArgoCD, Harness, Spinnaker, PagerDuty, Jira, Opsgenie, LaunchDarkly |
-| **How it works** | You register a "deploy" (webhook, CI event, CD sync). Sleuth auto-correlates commits via SHA and links incidents from your alerting tool. |
-| **DORA coverage** | All 4 metrics, real-time dashboard, team/service breakdown |
-| **Pricing** | Free tier (1 project), Growth $29/dev/mo, Enterprise custom |
-| **Differentiator** | Deploy verification — automatically checks error rates, latency after deploy to flag failures without waiting for an incident |
+> *"Utilizing an internal developer platform improves individual productivity, team performance, and organizational performance"* — but cautions that *"poorly implemented platforms can reduce change stability and throughput."*
 
-```
-How Sleuth connects your stack:
+### What Actually Works (From Enterprise Practitioners)
 
-  GitHub ──────┐
-  GHA ─────────┼──> Sleuth ──> DORA Dashboard
-  ArgoCD ──────┤       │
-  PagerDuty ───┘       └──> Slack/Email alerts on regression
-```
+Based on verified implementations and tool documentation:
 
-**Best for**: Teams that want DORA metrics working in hours, not weeks.
+**1. Standardize on the deployment event, not the branching model**
 
----
+Every team, regardless of branching strategy, has a moment when code reaches production. Anchor your metrics to that event. It comes from your CD tool (ArgoCD sync, Harness pipeline completion, GHA deployment workflow) and is consistent across teams.
 
-### 2. Faros AI (faros.ai) — Best for Enterprise / Multi-Tool
+**2. Provide a "team configuration" layer**
 
-**Why**: 100+ connectors, unified data model, works with any combination of tools.
+Let each team declare:
+- Their repos
+- Their CD tool and deploy detection method
+- Their integration branch (main, develop, release/*)
+- Their QA process (automated-only, manual, or hybrid)
 
-| Aspect | Detail |
-|--------|--------|
-| **Setup time** | 1-3 days |
-| **Integrations** | 100+ connectors: every major SCM, CI, CD, issue tracker, incident mgmt, deployment tool |
-| **How it works** | Connectors pull data from each tool into a normalized graph database. DORA metrics computed automatically from the unified model. Custom metrics via GraphQL. |
-| **DORA coverage** | All 4 + engineering metrics (rework rate, review time, PR cycle time) |
-| **Pricing** | Community Edition (open-source, self-hosted), Enterprise (managed) |
-| **Differentiator** | Works with literally any toolchain — if it has an API, Faros can ingest it |
+The platform normalizes the rest.
 
-```
-How Faros normalizes your stack:
+**3. Separate DORA metrics from operational sub-metrics**
 
-  GitHub ──────┐                    ┌──> DORA Metrics
-  GHA ─────────┤                    ├──> Engineering Metrics
-  Artifact Reg ┼──> Faros Graph ────┤
-  ArgoCD ──────┤    (normalized)    ├──> Custom Dashboards
-  Harness ─────┤                    ├──> Jira/Linear sync
-  PagerDuty ───┘                    └──> API / GraphQL
-```
+| Layer | Metrics | Audience | Standard |
+|-------|---------|----------|----------|
+| **DORA (org-level)** | 5 DORA metrics per team | Leadership, platform team | Industry standard |
+| **Operational (team-level)** | QA cycle time, review time, build time, queue time | Team leads, engineers | Internal standard |
+| **Diagnostic (drill-down)** | Per-release, per-PR, per-stage breakdown | Engineers debugging | Ad-hoc |
 
-**Best for**: Large organizations with 5+ tools in the delivery pipeline, or those needing metrics beyond DORA.
+**4. Accept that lead time will look bad — that's the point**
+
+For teams doing 2-week sprints with manual QA, lead time will be 2-4 weeks. That's not a failure of measurement — it's an accurate picture of reality. The metric is designed to make the case for investment in automation and continuous delivery.
+
+**5. Don't fake continuous delivery metrics onto a batched release process**
+
+If a team deploys biweekly, their deployment frequency is "biweekly." Don't count deployments to staging or UAT as "deployments" to inflate the number. Honest measurement is the prerequisite for honest improvement.
 
 ---
 
-### 3. Four Keys (dora.dev/fourkeys) — Best Open-Source / GCP-Native
+## Implementation Roadmap for Platform Teams
 
-**Why**: Built by the DORA team at Google. Event-driven, fully customizable, free.
+### Phase 1: Deploy Event Capture (Week 1-2)
 
-| Aspect | Detail |
-|--------|--------|
-| **Setup time** | 2-5 days |
-| **Integrations** | Any tool that can send a webhook (tool-agnostic by design) |
-| **How it works** | Webhooks → Cloud Function (event parser) → BigQuery (data store) → Looker (dashboard). You write parsers for each event type. |
-| **DORA coverage** | All 4 metrics with reference Looker dashboards |
-| **Pricing** | Free (open-source), GCP infra costs only (~$20-50/mo) |
-| **Differentiator** | Complete control, no vendor lock-in, endorsed by the DORA team |
+Get the deployment signal right first. Everything else builds on this.
 
 ```
-Architecture:
+For each CD tool in use:
+  ArgoCD → Enable notifications → webhook to your ingestion endpoint
+  Harness → Pipeline event webhook → your endpoint  
+  GHA     → Repository webhook (workflow_run events) → your endpoint
 
-  GitHub webhook ───────┐
-  GHA webhook ──────────┤
-  ArgoCD notification ──┼──> Cloud Function ──> BigQuery ──> Looker Dashboard
-  PagerDuty webhook ────┤    (event parser)     (storage)    (visualization)
-  Harness webhook ──────┘
+Validate: Can you answer "how many production deployments happened last week per team?"
 ```
 
-**Best for**: GCP-native teams, or those wanting full control and no vendor dependency.
+### Phase 2: Commit/PR Linkage (Week 2-3)
 
----
-
-## Tool Comparison Matrix
-
-| Criteria | Sleuth | Faros AI | Four Keys |
-|----------|--------|----------|-----------|
-| **Time to value** | Hours | Days | Days-Week |
-| **Tool-agnostic** | Yes (40+ integrations) | Yes (100+ connectors) | Yes (webhook-based) |
-| **Self-hosted option** | No | Yes (Community Edition) | Yes (GCP only) |
-| **Beyond DORA** | Deploy verification | Full eng metrics | No (DORA only) |
-| **Maintenance** | Zero (SaaS) | Low-Medium | Medium (own infra) |
-| **Cost** | $29/dev/mo | Free (CE) / Enterprise | GCP infra only |
-| **Best for** | Fast start, mid-size teams | Enterprise, complex toolchains | GCP-native, full control |
-| **GitHub + ArgoCD** | Native support | Native connectors | Custom webhook parser |
-
----
-
-## Implementation Roadmap
-
-### Week 1: Instrument Your Pipeline
+Connect deployments to the code changes they contain.
 
 ```
-1. Tag every container image with the commit SHA
-   docker build -t myapp:${GITHUB_SHA} .
+For each deployment event:
+  1. Get the deployed SHA/image tag
+  2. Query GitHub API for all commits between this deploy and the previous one
+  3. Query GitHub API for the PRs that introduced those commits
+  4. Store the mapping: deploy → [PR1, PR2, ...] → [commit1, commit2, ...]
 
-2. Ensure your CD tool (ArgoCD/Harness) records:
-   - What SHA was deployed
-   - When the deployment happened
-   - Whether it succeeded
-
-3. Link your incident management tool:
-   - PagerDuty: Tag incidents with service + deployment SHA
-   - Jira: Add "deployment_sha" custom field to incident issues
+Validate: Can you answer "what PRs were in last Tuesday's deployment?"
 ```
 
-### Week 2: Choose and Set Up Your Tool
+### Phase 3: Incident Linkage (Week 3-4)
+
+Connect incidents to deployments.
 
 ```
-Option A (Fastest): Sleuth
-  1. Sign up → Connect GitHub → Connect ArgoCD → Connect PagerDuty
-  2. Define your deploy sources (ArgoCD sync = deployment)
-  3. Dashboard shows DORA metrics immediately
+For PagerDuty/Jira/Opsgenie:
+  1. Webhook on incident create/resolve
+  2. Link to deployment via: time proximity OR explicit tagging
+  3. Classify: was this caused by a deployment or unrelated?
 
-Option B (Enterprise): Faros AI
-  1. Deploy Faros Community Edition (Docker Compose)
-  2. Configure connectors: GitHub, GHA, ArgoCD, PagerDuty
-  3. Run initial sync, review auto-computed DORA metrics
-  4. Customize dashboards via GraphQL
-
-Option C (Open-source): Four Keys
-  1. Deploy to GCP (Terraform module provided)
-  2. Configure webhooks from GitHub, ArgoCD, PagerDuty
-  3. Write event parsers for your specific event format
-  4. Import reference Looker dashboards
+Validate: Can you compute Change Fail Rate for last month?
 ```
 
-### Week 3: Baseline and Iterate
+### Phase 4: QA Stage Instrumentation (Week 4-5)
+
+Add manual QA visibility (the gap no tool fills for you).
 
 ```
-1. Run for 2 weeks to establish baseline
-2. Identify which DORA band you're in (Elite/High/Medium/Low)
-3. Pick ONE metric to improve first (usually Lead Time — it has the biggest downstream impact)
-4. Set quarterly targets (move one band per quarter is realistic)
+Option A: Jira workflow webhooks (qa_started / qa_passed transitions)
+Option B: GitHub Environment approvals (staging → manual-qa → production)
+Option C: Test management API (TestRail/Zephyr test cycle start/end)
+
+Validate: Can you answer "how long did QA take for the last 5 releases?"
+```
+
+### Phase 5: Dashboard and Reporting (Week 5-6)
+
+```
+Build Grafana/Looker dashboards at three levels:
+  1. Org overview: 5 DORA metrics, all teams, trend over time
+  2. Team detail: per-team DORA + lead time decomposition
+  3. Release drill-down: specific release → stages → bottleneck identification
+
+Validate: Can leadership see which teams are improving and which are stuck?
+```
+
+### Phase 6: Customization Layer (Ongoing)
+
+```
+Allow teams to self-configure:
+  - Add/remove repos
+  - Set their branching strategy  
+  - Configure deploy detection
+  - Set QA process flags
+
+Platform team maintains:
+  - Event ingestion infrastructure
+  - Canonical data model
+  - Dashboard templates
+  - Metric computation logic
 ```
 
 ---
@@ -405,6 +711,9 @@ gh api repos/{owner}/{repo}/actions/runs/{run_id}/timing
 
 # Per-job timing (queue time = started_at - created_at)
 gh api repos/{owner}/{repo}/actions/runs/{run_id}/jobs --jq '.jobs[] | {name: .name, queued: .created_at, started: .started_at, completed: .completed_at}'
+
+# Deployment environment approvals (for QA stage tracking)
+gh api repos/{owner}/{repo}/actions/runs/{run_id}/approvals
 ```
 
 ### ArgoCD
@@ -422,14 +731,14 @@ curl -s -H "Authorization: Bearer $ARGOCD_TOKEN" \
 ### PagerDuty
 
 ```bash
-# Incidents for MTTR
+# Incidents for Recovery Time
 curl -s -H "Authorization: Token token=$PD_TOKEN" \
   "https://api.pagerduty.com/incidents?since=2026-08-01&until=2026-09-01&statuses[]=resolved" \
   | jq '.incidents[] | {
       service: .service.summary,
       created: .created_at,
       resolved: .last_status_change_at,
-      mttr_minutes: (((.last_status_change_at | fromdateiso8601) - (.created_at | fromdateiso8601)) / 60)
+      recovery_minutes: (((.last_status_change_at | fromdateiso8601) - (.created_at | fromdateiso8601)) / 60)
     }'
 ```
 
@@ -437,9 +746,9 @@ curl -s -H "Authorization: Token token=$PD_TOKEN" \
 
 ## Related Resources
 
-- [DORA Quick Check](https://dora.dev/quickcheck/) — Self-assessment quiz
+- [DORA Quick Check](https://dora.dev/quickcheck/) — Self-assessment quiz (recommended starting point)
+- [DORA Core Model](https://dora.dev/research/) — Latest research findings (updated Jan 2026)
 - [Accelerate Book](https://itrevolution.com/product/accelerate/) — The foundational research
-- [DORA Core Model](https://dora.dev/research/) — Latest research findings
 - [Sleuth Docs](https://help.sleuth.io/) — Setup guides
-- [Faros Community](https://github.com/faros-ai/faros-community-edition) — Self-hosted setup
-- [Four Keys](https://github.com/dora-team/fourkeys) — Google's open-source implementation
+- [Faros Community Edition](https://github.com/faros-ai/faros-community-edition) — Self-hosted setup
+- [Four Keys (archived)](https://github.com/dora-team/fourkeys) — Archived Jan 2024, useful as architectural reference only
